@@ -135,9 +135,9 @@ pub enum ApiRequest {
         seed_artists: Vec<String>,
         generation: u64,
     },
-    Discover {
-        term: String,
+    MadeForYou {
         generation: u64,
+        force: bool,
     },
     MyPlaylists {
         offset: u32,
@@ -318,6 +318,7 @@ pub enum ApiRequest {
 }
 
 impl ApiRequest {
+    /// Identifies reads that share the background request concurrency limit.
     fn background(&self) -> bool {
         matches!(
             self,
@@ -326,7 +327,7 @@ impl ApiRequest {
                 | Self::TopTracks { .. }
                 | Self::TopArtists { .. }
                 | Self::Recommendations { .. }
-                | Self::Discover { .. }
+                | Self::MadeForYou { .. }
                 | Self::MyPlaylists { .. }
                 | Self::PlaylistSample { .. }
                 | Self::Contains { .. }
@@ -366,8 +367,7 @@ pub enum ApiResponse {
         generation: u64,
         result: ApiResult<Vec<Track>>,
     },
-    Discover {
-        term: String,
+    MadeForYou {
         generation: u64,
         result: ApiResult<Vec<Playlist>>,
     },
@@ -1332,6 +1332,7 @@ struct Worker {
     web_client_id: Option<String>,
     http: Http,
     api: Arc<ApiGateway>,
+    made_for_you: Arc<crate::made_for_you::MadeForYou>,
     background_session: Arc<tokio::sync::Semaphore>,
     art: ArtLoader,
     events: std::sync::mpsc::Sender<Event>,
@@ -1373,6 +1374,7 @@ struct Worker {
 }
 
 impl Worker {
+    /// Creates the command worker with separate API and Home readers.
     #[allow(clippy::too_many_arguments)]
     /// Initialize account-scoped dispatch state and the independent session background budget.
     fn new(
@@ -1405,6 +1407,7 @@ impl Worker {
             engine_proxy: None,
             web_client_id,
             api: Arc::new(ApiGateway::new(http.clone(), activity)),
+            made_for_you: Arc::new(crate::made_for_you::MadeForYou::new(http.clone())),
             background_session: Arc::new(tokio::sync::Semaphore::new(4)),
             http,
             art,
@@ -2459,11 +2462,13 @@ impl Worker {
         });
     }
 
+    /// Cancels in-flight account work and drops cached Home data on sign-out.
     fn sign_out(&mut self) {
         self.spotify_restore_started = true;
         self.cancel_search();
         self.signed_in = false;
         self.rootlist_pending = false;
+        self.made_for_you = Arc::new(crate::made_for_you::MadeForYou::new(self.http.clone()));
         self.session.send_modify(|generation| *generation += 1);
         self.authorization_attempt += 1;
         if let Err(error) = self.credentials.revoke_spotify() {
@@ -3265,6 +3270,7 @@ impl Worker {
     /// Cancel requests on sign-out and report completion under their original generation.
     fn dispatch(&self, request: ApiRequest) -> tokio::task::AbortHandle {
         let api = Arc::clone(&self.api);
+        let made_for_you = Arc::clone(&self.made_for_you);
         let shared_lease = self.credentials.lease(CredentialSlot::Shared);
         let personal_lease = self.credentials.lease(CredentialSlot::Personal);
         let background_session = Arc::clone(&self.background_session);
@@ -3276,7 +3282,7 @@ impl Worker {
             let (response, expired) = tokio::select! {
                 _ = session.changed() => return,
                 result = async {
-                    handle(&api, engine.as_deref(), &background_session, request).await
+                    handle(&api, &made_for_you, engine.as_deref(), &background_session, request).await
                 } => result,
             };
             // Apply completion on the command loop. A late response cannot
@@ -3325,7 +3331,7 @@ fn friendly_connect_error(error: &anyhow::Error) -> String {
     }
 }
 
-/// Classify a request by the coverage and playlist permissions its source must provide.
+/// Selects the Web API capability required when an operation needs a grant.
 fn operation_for(api: &ApiGateway, request: &ApiRequest) -> Operation {
     match request {
         ApiRequest::Me => Operation::CanonicalAccount,
@@ -3357,7 +3363,7 @@ fn operation_for(api: &ApiGateway, request: &ApiRequest) -> Operation {
         ApiRequest::MyPlaylists { offset: 0, .. } => Operation::PlaylistLibrary,
         ApiRequest::MyPlaylists { .. } => Operation::PlaylistLibraryContinuation,
         ApiRequest::CreatePlaylist { .. } => Operation::PlaylistCreation,
-        ApiRequest::Discover { .. } | ApiRequest::SearchPlaylists { .. } => {
+        ApiRequest::MadeForYou { .. } | ApiRequest::SearchPlaylists { .. } => {
             Operation::PlaylistSearch
         }
         ApiRequest::SearchCatalogue { .. } => Operation::CatalogSearch,
@@ -3395,9 +3401,10 @@ fn operation_for(api: &ApiGateway, request: &ApiRequest) -> Operation {
     }
 }
 
+/// Records returned playlist ownership for later metadata and item routing.
 fn observe_playlists(api: &ApiGateway, response: &ApiResponse) {
     match response {
-        ApiResponse::Discover {
+        ApiResponse::MadeForYou {
             result: Ok(playlists),
             ..
         } => api.observe_playlists(playlists),
@@ -3455,13 +3462,102 @@ fn observe_playlists(api: &ApiGateway, response: &ApiResponse) {
     }
 }
 
-/// Try a same-account session read, then the authorized Web API with its own background budget.
+const SHARED_MADE_FOR_YOU_TERMS: [&str; 4] =
+    ["Discover Weekly", "Release Radar", "Daily Mix", "daylist"];
+const UNSUPPORTED_DJ_URI: &str = "spotify:playlist:37i9dQZF1EYkqdzj48dyYq";
+
+/// Search is an approximation, used only when Spotify's personalized Home
+/// section cannot be read.
+async fn shared_made_for_you(api: &ApiGateway) -> ApiResult<Vec<Playlist>> {
+    let client = api.client_for(Operation::PlaylistSearch).await?;
+    let mut playlists = Vec::new();
+    let mut seen = HashSet::new();
+    for term in SHARED_MADE_FOR_YOU_TERMS {
+        let results = client.search(term, &["playlist"]).await?;
+        let mut matching: Vec<_> = results
+            .playlists
+            .into_iter()
+            .flat_map(|page| page.items)
+            .filter(|playlist| shared_made_for_you_match(playlist, term))
+            .filter(|playlist| seen.insert(playlist.name.to_ascii_lowercase()))
+            .take(6)
+            .collect();
+        playlists.append(&mut matching);
+    }
+    log::debug!("Spotify route operation=MadeForYou source=shared-fallback");
+    Ok(playlists)
+}
+
+/// Accepts only Spotify-owned fallback matches with supported playlist URIs.
+fn shared_made_for_you_match(playlist: &Playlist, term: &str) -> bool {
+    let name = playlist.name.trim();
+    let matches_name = name.eq_ignore_ascii_case(term)
+        || (term == "Daily Mix"
+            && name.strip_prefix("Daily Mix ").is_some_and(|number| {
+                !number.is_empty() && number.bytes().all(|c| c.is_ascii_digit())
+            }));
+    matches_name
+        && playlist.uri != UNSUPPORTED_DJ_URI
+        && (playlist.owner.id.as_deref() == Some("spotify")
+            || playlist.owner.display_name.as_deref() == Some("Spotify"))
+}
+
+/// Searches through the shared app only when the playback-session read fails.
+async fn with_shared_made_for_you_fallback<F, Fut>(
+    session_result: ApiResult<Vec<Playlist>>,
+    fallback: F,
+) -> ApiResult<Vec<Playlist>>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ApiResult<Vec<Playlist>>>,
+{
+    match session_result {
+        Ok(playlists) => Ok(playlists),
+        Err(error) => {
+            log::warn!("Made for you session read failed; trying shared search fallback: {error}");
+            fallback().await
+        }
+    }
+}
+
+/// Tries the session Home route before the shared fallback and routes other API work.
 async fn handle(
     api: &ApiGateway,
+    made_for_you: &crate::made_for_you::MadeForYou,
     engine: Option<&Engine>,
     background_session: &tokio::sync::Semaphore,
     request: ApiRequest,
 ) -> (ApiResponse, Option<ApiSource>) {
+    if let ApiRequest::MadeForYou { generation, force } = request {
+        let session_result = match engine
+            .filter(|engine| same_account(&engine.session().username(), api.account().as_ref()))
+        {
+            Some(engine) => {
+                let playback_account = engine.session().username();
+                made_for_you
+                    .load(engine.session(), force, || {
+                        api.home_context_token(&playback_account)
+                    })
+                    .await
+            }
+            None => Err(ApiError::Status {
+                status: 503,
+                message: "The playback session is unavailable for Made for you.".into(),
+            }),
+        };
+        let result = with_shared_made_for_you_fallback(session_result, || async {
+            shared_made_for_you(api).await
+        })
+        .await;
+        if let Ok(playlists) = &result {
+            api.observe_playlists(playlists);
+        }
+        let expired = match &result {
+            Err(ApiError::SignInExpired { api_source }) => Some(*api_source),
+            _ => None,
+        };
+        return (ApiResponse::MadeForYou { generation, result }, expired);
+    }
     let operation = operation_for(api, &request);
     // A session whose long-lived connection has dropped still answers over
     // its HTTP client, so the engine's presence is the only liveness test;
@@ -3551,15 +3647,7 @@ async fn handle(
             generation,
             result: routed!(recommendations(&seed_tracks, &seed_artists, 20)),
         },
-        ApiRequest::Discover { term, generation } => {
-            let result = routed!(search(&term, &["playlist"]))
-                .map(|results| results.playlists.map(|page| page.items).unwrap_or_default());
-            ApiResponse::Discover {
-                term,
-                generation,
-                result,
-            }
-        }
+        ApiRequest::MadeForYou { .. } => unreachable!("handled before Web API routing"),
         ApiRequest::MyPlaylists { offset, generation } => {
             let personal =
                 matches!(&selected, Ok(client) if client.source() == ApiSource::Personal);
@@ -6147,10 +6235,12 @@ mod session_tests {
         }
         let background_session = tokio::sync::Semaphore::new(4);
         let _held_session = background_session.acquire_many(4).await.unwrap();
+        let made_for_you = crate::made_for_you::MadeForYou::new(crate::http::Http::default());
         let (response, expired) = tokio::time::timeout(
             Duration::from_secs(1),
             handle(
                 &api,
+                &made_for_you,
                 None,
                 &background_session,
                 ApiRequest::TopArtists { generation: 7 },
@@ -6426,6 +6516,50 @@ mod cover_routing_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Avoids shared playlist search after a successful session read.
+    #[tokio::test]
+    async fn made_for_you_uses_shared_search_only_after_session_failure() {
+        let session_playlist = Playlist {
+            id: "session".into(),
+            ..Default::default()
+        };
+        let result =
+            with_shared_made_for_you_fallback(Ok(vec![session_playlist.clone()]), || async {
+                panic!("the successful session must not search")
+            })
+            .await;
+        assert_eq!(result.unwrap(), vec![session_playlist]);
+
+        let result = with_shared_made_for_you_fallback(Err(ApiError::RateLimited), || async {
+            Ok(vec![Playlist {
+                id: "shared".into(),
+                ..Default::default()
+            }])
+        })
+        .await;
+        assert_eq!(result.unwrap()[0].id, "shared");
+    }
+
+    /// Limits fallback results to Spotify-owned lists with playable contexts.
+    #[test]
+    fn shared_suggestions_are_spotify_owned_and_exclude_dj() {
+        let mut playlist = Playlist {
+            name: "Daily Mix 3".into(),
+            uri: "spotify:playlist:mix".into(),
+            ..Default::default()
+        };
+        playlist.owner.id = Some("spotify".into());
+        assert!(shared_made_for_you_match(&playlist, "Daily Mix"));
+        playlist.name = "Daily Mix Party".into();
+        assert!(!shared_made_for_you_match(&playlist, "Daily Mix"));
+        playlist.name = "Daily Mix 3".into();
+        playlist.owner.id = Some("other".into());
+        assert!(!shared_made_for_you_match(&playlist, "Daily Mix"));
+        playlist.owner.id = Some("spotify".into());
+        playlist.uri = UNSUPPORTED_DJ_URI.into();
+        assert!(!shared_made_for_you_match(&playlist, "Daily Mix"));
+    }
 
     #[test]
     fn six_session_drops_in_ten_minutes_give_up() {
